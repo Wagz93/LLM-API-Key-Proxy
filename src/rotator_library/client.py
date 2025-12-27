@@ -2607,13 +2607,19 @@ class RotatingClient:
             **openai_request,
         )
 
-        # NOTE: Input tokens are set to 0 as a placeholder.
-        # The actual input token count will be available in the usage data
-        # from the OpenAI stream's final chunk when stream_options.include_usage is true.
-        # The streaming converter will update this value from the usage data if available.
-        # TODO: For accurate initial token counting, implement proper tokenization
-        # using the model's tokenizer before streaming begins.
+        # Attempt to count input tokens using the existing token_count method.
+        # This provides accurate initial token counts for the message_start event.
+        # Falls back to 0 if token counting fails (e.g., unsupported model).
         input_tokens = 0
+        try:
+            input_tokens = self.token_count(
+                model=openai_request.get("model", ""),
+                messages=openai_request.get("messages", []),
+            )
+        except Exception:
+            # Token counting failed, use 0 as fallback.
+            # The streaming converter will update from usage data if available.
+            pass
 
         # Convert to Anthropic format
         async for event in convert_openai_stream_to_anthropic(

@@ -42,10 +42,14 @@ class StreamingState:
         self.input_tokens = 0
         self.output_tokens = 0
         self.stop_reason: Optional[str] = None
-        # Track tool calls: OpenAI tool_index -> Anthropic content_block_index
+        # Track tool calls: OpenAI tool_index -> content block info
         self.tool_call_blocks: Dict[int, Dict[str, Any]] = {}
         # Map from OpenAI tool_index to assigned Anthropic content_block_index
         self.tool_index_to_content_index: Dict[int, int] = {}
+        # Track the text content block index (if any)
+        self.text_block_index: Optional[int] = None
+        # Track if text block was closed
+        self.text_block_closed: bool = False
 
 
 def _format_sse_event(event_type: str, data: Dict[str, Any]) -> str:
@@ -235,6 +239,7 @@ async def _process_openai_chunk(
                 state.content_block_index += 1
 
             state.current_content_type = "text"
+            state.text_block_index = state.content_block_index
             yield _create_content_block_start_event(state.content_block_index, "text")
             state.has_sent_content_block_start = True
 
@@ -253,9 +258,10 @@ async def _process_openai_chunk(
 
         # Check if this is a new tool call
         if tool_index not in state.tool_call_blocks:
-            # Close previous content block if any
-            if state.has_sent_content_block_start and state.current_content_type != "tool_use":
-                yield _create_content_block_stop_event(state.content_block_index)
+            # Close previous text content block if any (before switching to tool_use)
+            if state.has_sent_content_block_start and state.current_content_type == "text" and not state.text_block_closed:
+                yield _create_content_block_stop_event(state.text_block_index)
+                state.text_block_closed = True
                 state.content_block_index += 1
 
             state.current_content_type = "tool_use"
@@ -308,16 +314,16 @@ async def _process_openai_chunk(
 
 async def _finalize_stream(state: StreamingState) -> AsyncGenerator[str, None]:
     """Finalize the stream by closing content blocks and sending final events."""
-    # Close any open content block
+    # Close any open content blocks
     if state.has_sent_content_block_start:
-        # Close text block (if it wasn't closed when transitioning to tool calls)
-        if state.current_content_type == "text" and not state.tool_call_blocks:
-            # content_block_index was already advanced for tool calls, so use previous index
-            yield _create_content_block_stop_event(state.content_block_index)
+        # Close text block if it exists and wasn't already closed
+        if state.text_block_index is not None and not state.text_block_closed:
+            yield _create_content_block_stop_event(state.text_block_index)
+            state.text_block_closed = True
 
         # Close all tool call blocks using their assigned content indices
         for tool_index, block_info in state.tool_call_blocks.items():
-            content_index = block_info.get("content_index", state.tool_index_to_content_index.get(tool_index, tool_index))
+            content_index = block_info["content_index"]
             yield _create_content_block_stop_event(content_index)
 
     # Send message_delta with stop_reason
