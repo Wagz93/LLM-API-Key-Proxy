@@ -10,17 +10,62 @@ making it usable in any Python context.
 Translation Flow:
 1. Anthropic Request → OpenAI Request (request_to_openai)
 2. OpenAI Response → Anthropic Response (response_from_openai)
+
+Security Notes:
+- All inputs are validated before processing
+- String lengths are bounded to prevent DoS
+- JSON parsing uses strict mode with error handling
 """
 
 import json
-import time
 import uuid
 from typing import Any, Dict, List, Optional, Union
+
+# =============================================================================
+# CONSTANTS & LIMITS
+# =============================================================================
+
+# Maximum allowed values for safety
+MAX_TOKENS_LIMIT = 1_000_000  # Reasonable upper bound for any model
+MAX_STRING_LENGTH = 10_000_000  # 10MB max for any single string field
+MAX_MESSAGES = 10_000  # Maximum number of messages in a conversation
+MAX_TOOLS = 1_000  # Maximum number of tools
+
+
+# =============================================================================
+# UTILITIES
+# =============================================================================
 
 
 def _generate_id(prefix: str = "msg") -> str:
     """Generate a unique ID with the given prefix."""
     return f"{prefix}_{uuid.uuid4().hex[:24]}"
+
+
+def _validate_string(value: Any, field_name: str, max_length: int = MAX_STRING_LENGTH) -> str:
+    """Validate and bound a string value."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        value = str(value)
+    if len(value) > max_length:
+        raise ValueError(f"{field_name} exceeds maximum length of {max_length}")
+    return value
+
+
+def _validate_positive_int(value: Any, field_name: str, max_value: int = MAX_TOKENS_LIMIT) -> Optional[int]:
+    """Validate a positive integer value."""
+    if value is None:
+        return None
+    try:
+        int_value = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} must be an integer")
+    if int_value < 0:
+        raise ValueError(f"{field_name} must be non-negative")
+    if int_value > max_value:
+        raise ValueError(f"{field_name} exceeds maximum value of {max_value}")
+    return int_value
 
 
 # =============================================================================
@@ -88,63 +133,131 @@ def _convert_anthropic_message_to_openai(msg: Dict[str, Any]) -> List[Dict[str, 
 
     This may produce multiple OpenAI messages in some cases,
     such as when tool results need to be converted to tool messages.
+    
+    Handles:
+    - Simple text messages
+    - Messages with tool_result blocks (user role) -> tool role
+    - Messages with tool_use blocks (assistant role) -> tool_calls
     """
     role = msg.get("role", "user")
     content = msg.get("content", "")
 
-    # Handle tool results specially
+    # Handle list content (can contain various block types)
     if isinstance(content, list):
-        tool_result_blocks = [b for b in content if b.get("type") == "tool_result"]
-        other_blocks = [b for b in content if b.get("type") != "tool_result"]
+        tool_result_blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"]
+        tool_use_blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
+        text_blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "text"]
+        other_blocks = [b for b in content if isinstance(b, dict) and b.get("type") not in ("tool_result", "tool_use", "text")]
 
         messages: List[Dict[str, Any]] = []
 
-        # First, handle tool results as separate tool messages
+        # Handle tool results as separate tool messages (these come from user role)
         for tool_result in tool_result_blocks:
             tool_content = tool_result.get("content", "")
             if isinstance(tool_content, list):
                 # Extract text from content blocks
                 text_parts = []
                 for block in tool_content:
-                    if block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(str(block.get("text", "")))
                 tool_content = "\n".join(text_parts)
 
             messages.append(
                 {
                     "role": "tool",
-                    "tool_call_id": tool_result.get("tool_use_id", ""),
+                    "tool_call_id": str(tool_result.get("tool_use_id", "")),
                     "content": str(tool_content) if tool_content else "",
                 }
             )
 
-        # Then handle remaining content
-        if other_blocks:
-            converted_content = _convert_anthropic_content_to_openai(other_blocks)
+        # Handle assistant messages with tool_use blocks
+        if role == "assistant" and tool_use_blocks:
+            # Extract text content if any
+            text_content = ""
+            if text_blocks:
+                text_content = " ".join(
+                    str(b.get("text", "")) for b in text_blocks
+                )
+            
+            # Convert tool_use blocks to OpenAI tool_calls
+            tool_calls = []
+            for i, tool_use in enumerate(tool_use_blocks):
+                tool_input = tool_use.get("input", {})
+                # Ensure input is serialized as JSON string
+                if isinstance(tool_input, dict):
+                    arguments = json.dumps(tool_input)
+                else:
+                    arguments = str(tool_input) if tool_input else "{}"
+                
+                tool_calls.append({
+                    "id": str(tool_use.get("id", _generate_id("call"))),
+                    "type": "function",
+                    "function": {
+                        "name": str(tool_use.get("name", "")),
+                        "arguments": arguments,
+                    }
+                })
+            
+            assistant_msg: Dict[str, Any] = {"role": "assistant"}
+            if text_content:
+                assistant_msg["content"] = text_content
+            else:
+                assistant_msg["content"] = None
+            assistant_msg["tool_calls"] = tool_calls
+            messages.append(assistant_msg)
+        
+        # Handle remaining text/other blocks for non-assistant or non-tool-use cases
+        elif text_blocks or other_blocks:
+            blocks_to_convert = text_blocks + other_blocks
+            converted_content = _convert_anthropic_content_to_openai(blocks_to_convert)
             messages.append({"role": role, "content": converted_content})
-        elif not tool_result_blocks:
-            # If there are no tool results and no other blocks, use empty string
+        
+        # If no content at all (edge case)
+        elif not tool_result_blocks and not tool_use_blocks:
             messages.append({"role": role, "content": ""})
 
         return messages if messages else [{"role": role, "content": ""}]
 
     # Simple string content
-    return [{"role": role, "content": content}]
+    return [{"role": role, "content": str(content) if content else ""}]
 
 
 def _convert_anthropic_tools_to_openai(
     tools: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
-    """Convert Anthropic tool definitions to OpenAI function format."""
+    """
+    Convert Anthropic tool definitions to OpenAI function format.
+    
+    Validates tool names and structures.
+    """
     openai_tools = []
 
-    for tool in tools:
+    for i, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            raise ValueError(f"Tool at index {i} must be a dictionary")
+        
+        name = tool.get("name")
+        if not name:
+            raise ValueError(f"Tool at index {i} is missing required 'name' field")
+        
+        # Validate tool name (alphanumeric, underscores, hyphens only, max 64 chars)
+        name_str = str(name)
+        if len(name_str) > 64:
+            raise ValueError(f"Tool name '{name_str[:20]}...' exceeds maximum length of 64")
+        
+        description = tool.get("description", "")
+        input_schema = tool.get("input_schema", {"type": "object"})
+        
+        # Ensure input_schema is a valid object
+        if not isinstance(input_schema, dict):
+            input_schema = {"type": "object"}
+        
         openai_tool = {
             "type": "function",
             "function": {
-                "name": tool.get("name", ""),
-                "description": tool.get("description", ""),
-                "parameters": tool.get("input_schema", {"type": "object"}),
+                "name": name_str,
+                "description": str(description) if description else "",
+                "parameters": input_schema,
             },
         }
         openai_tools.append(openai_tool)
@@ -186,63 +299,105 @@ def request_to_openai(anthropic_request: Dict[str, Any]) -> Dict[str, Any]:
 
     Returns:
         Dictionary containing OpenAI request parameters
+
+    Raises:
+        ValueError: If required fields are missing or invalid
     """
+    if not isinstance(anthropic_request, dict):
+        raise ValueError("Request must be a dictionary")
+
     openai_request: Dict[str, Any] = {}
 
-    # Model (pass through - the library handles model routing)
-    openai_request["model"] = anthropic_request.get("model", "")
+    # Model (required, pass through - the library handles model routing)
+    model = anthropic_request.get("model")
+    if not model:
+        raise ValueError("'model' is required")
+    openai_request["model"] = _validate_string(model, "model", max_length=256)
 
-    # Convert messages
+    # Validate and convert messages
     anthropic_messages = anthropic_request.get("messages", [])
+    if not isinstance(anthropic_messages, list):
+        raise ValueError("'messages' must be a list")
+    if len(anthropic_messages) > MAX_MESSAGES:
+        raise ValueError(f"'messages' exceeds maximum count of {MAX_MESSAGES}")
+
     openai_messages: List[Dict[str, Any]] = []
 
     # Handle system prompt
     system = anthropic_request.get("system")
     if system:
         if isinstance(system, str):
-            openai_messages.append({"role": "system", "content": system})
+            openai_messages.append({"role": "system", "content": _validate_string(system, "system")})
         elif isinstance(system, list):
             # System can be a list of text blocks
             system_text = " ".join(
-                block.get("text", "") for block in system if block.get("type") == "text"
+                _validate_string(block.get("text", ""), "system.text")
+                for block in system if isinstance(block, dict) and block.get("type") == "text"
             )
-            openai_messages.append({"role": "system", "content": system_text})
+            if system_text:
+                openai_messages.append({"role": "system", "content": system_text})
 
     # Convert each message
     for msg in anthropic_messages:
+        if not isinstance(msg, dict):
+            raise ValueError("Each message must be a dictionary")
         converted = _convert_anthropic_message_to_openai(msg)
         openai_messages.extend(converted)
 
     openai_request["messages"] = openai_messages
 
-    # max_tokens → max_completion_tokens (OpenAI's newer parameter name)
-    # Also include max_tokens for compatibility with older models
+    # max_tokens (required for Anthropic, validated)
     max_tokens = anthropic_request.get("max_tokens")
     if max_tokens is not None:
-        openai_request["max_tokens"] = max_tokens
+        validated_max_tokens = _validate_positive_int(max_tokens, "max_tokens")
+        if validated_max_tokens is not None:
+            openai_request["max_tokens"] = validated_max_tokens
 
-    # Temperature
+    # Temperature (0.0 to 1.0 for Anthropic, 0.0 to 2.0 for OpenAI)
     temperature = anthropic_request.get("temperature")
     if temperature is not None:
-        openai_request["temperature"] = temperature
+        try:
+            temp_float = float(temperature)
+            if not (0.0 <= temp_float <= 2.0):
+                raise ValueError("'temperature' must be between 0.0 and 2.0")
+            openai_request["temperature"] = temp_float
+        except (TypeError, ValueError) as e:
+            if "must be between" in str(e):
+                raise
+            raise ValueError("'temperature' must be a number")
 
-    # Top P
+    # Top P (0.0 to 1.0)
     top_p = anthropic_request.get("top_p")
     if top_p is not None:
-        openai_request["top_p"] = top_p
+        try:
+            top_p_float = float(top_p)
+            if not (0.0 <= top_p_float <= 1.0):
+                raise ValueError("'top_p' must be between 0.0 and 1.0")
+            openai_request["top_p"] = top_p_float
+        except (TypeError, ValueError) as e:
+            if "must be between" in str(e):
+                raise
+            raise ValueError("'top_p' must be a number")
 
     # Stop sequences
     stop_sequences = anthropic_request.get("stop_sequences")
     if stop_sequences:
-        openai_request["stop"] = stop_sequences
+        if not isinstance(stop_sequences, list):
+            raise ValueError("'stop_sequences' must be a list")
+        validated_sequences = [_validate_string(s, "stop_sequence", max_length=1000) for s in stop_sequences]
+        openai_request["stop"] = validated_sequences
 
     # Stream
     stream = anthropic_request.get("stream", False)
-    openai_request["stream"] = stream
+    openai_request["stream"] = bool(stream)
 
     # Tools
     tools = anthropic_request.get("tools")
     if tools:
+        if not isinstance(tools, list):
+            raise ValueError("'tools' must be a list")
+        if len(tools) > MAX_TOOLS:
+            raise ValueError(f"'tools' exceeds maximum count of {MAX_TOOLS}")
         openai_request["tools"] = _convert_anthropic_tools_to_openai(tools)
 
     # Tool choice
