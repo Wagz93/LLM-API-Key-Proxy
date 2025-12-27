@@ -2481,6 +2481,176 @@ class RotatingClient:
         else:
             raise ValueError("Either 'text' or 'messages' must be provided.")
 
+    # =========================================================================
+    # ANTHROPIC COMPATIBILITY LAYER
+    # =========================================================================
+
+    async def anthropic_messages(
+        self,
+        request: Optional[Any] = None,
+        pre_request_callback: Optional[callable] = None,
+        **kwargs,
+    ) -> Union[Dict[str, Any], AsyncGenerator[str, None]]:
+        """
+        Anthropic-compatible Messages API endpoint.
+
+        This method accepts Anthropic-format requests, translates them to OpenAI format,
+        calls the internal acompletion method, and translates the response back to
+        Anthropic format.
+
+        Args:
+            request: Optional request object, used for client disconnect checks and logging.
+            pre_request_callback: Optional async callback function to be called before each API request attempt.
+            **kwargs: Anthropic Messages API parameters (model, messages, max_tokens, etc.)
+
+        Returns:
+            For non-streaming: Dictionary in Anthropic Messages API response format
+            For streaming: Async generator yielding Anthropic SSE events
+
+        Example:
+            # Non-streaming
+            response = await client.anthropic_messages(
+                model="anthropic/claude-3-5-sonnet",
+                messages=[{"role": "user", "content": "Hello!"}],
+                max_tokens=1024
+            )
+
+            # Streaming
+            async for event in client.anthropic_messages(
+                model="anthropic/claude-3-5-sonnet",
+                messages=[{"role": "user", "content": "Hello!"}],
+                max_tokens=1024,
+                stream=True
+            ):
+                print(event)
+        """
+        from .anthropic_compat import (
+            request_to_openai,
+            response_from_openai,
+            convert_openai_stream_to_anthropic,
+        )
+
+        # Store original model for response
+        original_model = kwargs.get("model", "")
+
+        # Translate Anthropic request to OpenAI format
+        openai_request = request_to_openai(kwargs)
+
+        is_streaming = kwargs.get("stream", False)
+
+        if is_streaming:
+            # For streaming, wrap the OpenAI stream with Anthropic conversion
+            return self._anthropic_streaming_wrapper(
+                request=request,
+                pre_request_callback=pre_request_callback,
+                original_model=original_model,
+                openai_request=openai_request,
+            )
+        else:
+            # For non-streaming, call acompletion and translate response
+            response = await self._execute_with_retry(
+                litellm.acompletion,
+                request=request,
+                pre_request_callback=pre_request_callback,
+                **openai_request,
+            )
+
+            if response is None:
+                # Return error response in Anthropic format
+                return {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "Request failed after all retries",
+                    },
+                }
+
+            # Check if response is an error dict (from error accumulator)
+            if isinstance(response, dict) and "error" in response:
+                return {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": response["error"].get("message", "Unknown error"),
+                    },
+                }
+
+            # Convert response to dict if it's a Pydantic model
+            if hasattr(response, "model_dump"):
+                response_dict = response.model_dump()
+            elif hasattr(response, "dict"):
+                response_dict = response.dict()
+            else:
+                response_dict = response
+
+            # Translate OpenAI response to Anthropic format
+            return response_from_openai(response_dict, original_model)
+
+    async def _anthropic_streaming_wrapper(
+        self,
+        request: Optional[Any],
+        pre_request_callback: Optional[callable],
+        original_model: str,
+        openai_request: Dict[str, Any],
+    ) -> AsyncGenerator[str, None]:
+        """
+        Wrapper for streaming Anthropic requests.
+
+        Converts OpenAI SSE stream to Anthropic SSE format.
+        """
+        from .anthropic_compat import convert_openai_stream_to_anthropic
+
+        # Get the OpenAI stream
+        openai_stream = self._streaming_acompletion_with_retry(
+            request=request,
+            pre_request_callback=pre_request_callback,
+            **openai_request,
+        )
+
+        # Estimate input tokens (rough estimate based on message length)
+        # This is a placeholder; proper token counting would require the tokenizer
+        input_tokens = 0
+
+        # Convert to Anthropic format
+        async for event in convert_openai_stream_to_anthropic(
+            openai_stream, original_model, input_tokens
+        ):
+            yield event
+
+    def anthropic_count_tokens(self, **kwargs) -> int:
+        """
+        Count tokens for an Anthropic-format request.
+
+        This method accepts Anthropic-format messages and returns the token count
+        using the internal token counting mechanism.
+
+        Args:
+            **kwargs: Anthropic count_tokens API parameters:
+                - model: Model name
+                - messages: List of Anthropic-format messages
+                - system: Optional system prompt
+                - tools: Optional list of tools
+
+        Returns:
+            Token count for the input
+
+        Example:
+            count = client.anthropic_count_tokens(
+                model="anthropic/claude-3-5-sonnet",
+                messages=[{"role": "user", "content": "Hello!"}]
+            )
+        """
+        from .anthropic_compat import request_to_openai
+
+        # Translate to OpenAI format
+        openai_request = request_to_openai(kwargs)
+
+        # Use internal token counter with OpenAI format
+        return self.token_count(
+            model=openai_request.get("model", ""),
+            messages=openai_request.get("messages", []),
+        )
+
     async def get_available_models(self, provider: str) -> List[str]:
         """Returns a list of available models for a specific provider, with caching."""
         lib_logger.info(f"Getting available models for provider: {provider}")
