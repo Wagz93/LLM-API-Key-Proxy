@@ -2607,8 +2607,12 @@ class RotatingClient:
             **openai_request,
         )
 
-        # Estimate input tokens (rough estimate based on message length)
-        # This is a placeholder; proper token counting would require the tokenizer
+        # NOTE: Input tokens are set to 0 as a placeholder.
+        # The actual input token count will be available in the usage data
+        # from the OpenAI stream's final chunk when stream_options.include_usage is true.
+        # The streaming converter will update this value from the usage data if available.
+        # TODO: For accurate initial token counting, implement proper tokenization
+        # using the model's tokenizer before streaming begins.
         input_tokens = 0
 
         # Convert to Anthropic format

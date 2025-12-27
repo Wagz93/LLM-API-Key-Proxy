@@ -12,6 +12,7 @@ Translation Flow:
 2. OpenAI Response → Anthropic Response (response_from_openai)
 """
 
+import json
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Union
@@ -276,8 +277,6 @@ def _convert_openai_content_to_anthropic(
             arguments = function.get("arguments", "{}")
 
             # Parse arguments JSON
-            import json
-
             try:
                 parsed_args = json.loads(arguments) if arguments else {}
             except json.JSONDecodeError:
