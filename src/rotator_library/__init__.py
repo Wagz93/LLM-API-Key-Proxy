@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     from .providers import PROVIDER_PLUGINS
     from .providers.provider_interface import ProviderInterface
     from .model_info_service import ModelInfoService, ModelInfo, ModelMetadata
+    from . import anthropic_compat
 
 __all__ = [
     "RotatingClient",
@@ -15,11 +16,15 @@ __all__ = [
     "ModelInfoService",
     "ModelInfo",
     "ModelMetadata",
+    "anthropic_compat",
 ]
+
+# Cache for lazy-loaded modules
+_lazy_loaded_modules = {}
 
 
 def __getattr__(name):
-    """Lazy-load PROVIDER_PLUGINS and ModelInfoService to speed up module import."""
+    """Lazy-load PROVIDER_PLUGINS, ModelInfoService, and anthropic_compat to speed up module import."""
     if name == "PROVIDER_PLUGINS":
         from .providers import PROVIDER_PLUGINS
 
@@ -36,4 +41,12 @@ def __getattr__(name):
         from .model_info_service import ModelMetadata
 
         return ModelMetadata
+    if name == "anthropic_compat":
+        # Use importlib to avoid recursion with `from . import`
+        if "anthropic_compat" not in _lazy_loaded_modules:
+            import importlib
+            _lazy_loaded_modules["anthropic_compat"] = importlib.import_module(
+                ".anthropic_compat", package=__name__
+            )
+        return _lazy_loaded_modules["anthropic_compat"]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
