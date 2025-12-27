@@ -144,10 +144,24 @@ def _convert_anthropic_message_to_openai(msg: Dict[str, Any]) -> List[Dict[str, 
 
     # Handle list content (can contain various block types)
     if isinstance(content, list):
-        tool_result_blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"]
-        tool_use_blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
-        text_blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "text"]
-        other_blocks = [b for b in content if isinstance(b, dict) and b.get("type") not in ("tool_result", "tool_use", "text")]
+        # Single pass categorization for performance
+        tool_result_blocks: List[Dict[str, Any]] = []
+        tool_use_blocks: List[Dict[str, Any]] = []
+        text_blocks: List[Dict[str, Any]] = []
+        other_blocks: List[Dict[str, Any]] = []
+        
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "tool_result":
+                tool_result_blocks.append(block)
+            elif block_type == "tool_use":
+                tool_use_blocks.append(block)
+            elif block_type == "text":
+                text_blocks.append(block)
+            else:
+                other_blocks.append(block)
 
         messages: List[Dict[str, Any]] = []
 
@@ -240,7 +254,7 @@ def _convert_anthropic_tools_to_openai(
         if not name:
             raise ValueError(f"Tool at index {i} is missing required 'name' field")
         
-        # Validate tool name (alphanumeric, underscores, hyphens only, max 64 chars)
+        # Validate tool name length (max 64 chars per OpenAI spec)
         name_str = str(name)
         if len(name_str) > 64:
             raise ValueError(f"Tool name '{name_str[:20]}...' exceeds maximum length of 64")
@@ -353,7 +367,8 @@ def request_to_openai(anthropic_request: Dict[str, Any]) -> Dict[str, Any]:
         if validated_max_tokens is not None:
             openai_request["max_tokens"] = validated_max_tokens
 
-    # Temperature (0.0 to 1.0 for Anthropic, 0.0 to 2.0 for OpenAI)
+    # Temperature: Anthropic supports 0.0-1.0, OpenAI supports 0.0-2.0
+    # We accept the wider OpenAI range since we're routing to various backends
     temperature = anthropic_request.get("temperature")
     if temperature is not None:
         try:
