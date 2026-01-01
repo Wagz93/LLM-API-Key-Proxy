@@ -1478,7 +1478,12 @@ async def event_logging_batch(request: Request):
         data = await request.json()
         
         # Log the event at debug level for troubleshooting
-        logging.debug(f"Received telemetry event: {len(data.get('events', []))} events")
+        # Safely handle the events field - it might be None, string, or list
+        events = data.get('events', [])
+        if isinstance(events, list):
+            logging.debug(f"Received telemetry event: {len(events)} events")
+        else:
+            logging.debug("Received telemetry event: non-list events field")
         
         # Return success response (Claude Code expects a 200 OK)
         return {"status": "ok"}

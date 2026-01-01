@@ -56,16 +56,20 @@ def test_telemetry_endpoint(base_url: str) -> bool:
     # Test 2: Payload with events
     print("\n[Test 2] Payload with events array...")
     try:
+        # Use current timestamp instead of hardcoded future date
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        
         payload = {
             "events": [
                 {
                     "type": "session_start",
-                    "timestamp": "2026-01-01T15:00:00Z",
+                    "timestamp": now,
                     "metadata": {"version": "1.0"}
                 },
                 {
                     "type": "request_sent",
-                    "timestamp": "2026-01-01T15:00:05Z",
+                    "timestamp": now,
                     "metadata": {"model": "claude-3-opus"}
                 }
             ]
