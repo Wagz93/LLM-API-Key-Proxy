@@ -788,7 +788,8 @@ async def anthropic_messages(
                 model=openai_request.get("model", ""),
                 messages=openai_request.get("messages", []),
             )
-        except Exception:
+        except (ValueError, TypeError, litellm.OpenAIError) as e:
+            logging.debug(f"Token counting failed for streaming preflight: {e}")
             input_tokens = 0
 
         if is_streaming:
@@ -810,7 +811,7 @@ async def anthropic_messages(
                 request=request, **openai_request
             )
 
-            if hasattr(openai_response, "model_dump"):
+            if isinstance(openai_response, BaseModel):
                 openai_payload = openai_response.model_dump()
             elif hasattr(openai_response, "dict"):
                 openai_payload = openai_response.dict()
