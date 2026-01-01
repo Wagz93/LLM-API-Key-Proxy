@@ -1,0 +1,50 @@
+INFO:     Started server process [3424]
+INFO:     Waiting for application startup.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🚀 Starting Anthropic-Compatible Proxy on 0.0.0.0:8000
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[32mInitializing RotatingClient...[0m
+[33mNo provider credentials configured. The client will be unable to make any API requests.[0m
+[32mStarting automated OAuth credential discovery...[0m
+[32mOAuth credential discovery complete.[0m
+[32mBackground token refresher started. Check interval: 600 seconds.[0m
+[32mModelRegistry started (refresh every 21600s)[0m
+[32mServer ready in 3.60s[0m
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅  [bold green]PROXY READY FOR CLAUDE CODE[/bold green]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+To connect Claude Code to this proxy:
+
+1. Run configuration command:
+   [cyan]claude config set base_url http://localhost:8000/v1[/cyan]
+
+2. Authentication is DISABLED. You can use any string as a key.
+
+Logs will appear below...
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[32mOpenRouter: 353 models loaded[0m
+[32mModels.dev: 1929 models loaded[0m
+[32m14:13 - 127.0.0.1:46072 - provider: N/A, model: gpt-3.5-turbo - N/A[0m
+[31mAnthropic Request Failed: No API keys or OAuth credentials configured for provider: gpt-3.5-turbo[0m
+Traceback (most recent call last):
+  File "/app/src/proxy_app/main.py", line 326, in anthropic_messages
+    response = await client.anthropic_messages(request=request, **body)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/src/rotator_library/client.py", line 2551, in anthropic_messages
+    response = await self._execute_with_retry(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/src/rotator_library/client.py", line 880, in _execute_with_retry
+    raise ValueError(
+ValueError: No API keys or OAuth credentials configured for provider: gpt-3.5-turbo
+INFO:     127.0.0.1:46072 - "POST /v1/messages HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+[32mBackground token refresher stopped.[0m
+[32mModelRegistry stopped[0m
+[32mServer shutdown complete.[0m
+INFO:     Application shutdown complete.
+INFO:     Finished server process [3424]
