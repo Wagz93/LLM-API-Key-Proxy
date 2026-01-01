@@ -1,12 +1,13 @@
 import time
-
-# Phase 1: Minimal imports for arg parsing and TUI
 import asyncio
 import os
 from pathlib import Path
 import sys
 import argparse
 import logging
+import json
+import uuid
+from typing import AsyncGenerator, Any, List, Optional, Union, Dict
 
 # --- Argument Parsing (BEFORE heavy imports) ---
 parser = argparse.ArgumentParser(description="API Key Proxy Server")
@@ -97,17 +98,15 @@ _console = Console()
 print("  → Loading FastAPI framework...")
 with _console.status("[dim]Loading FastAPI framework...", spinner="dots"):
     from contextlib import asynccontextmanager
-    from fastapi import FastAPI, Request, HTTPException, Depends
+    from fastapi import FastAPI, Request, HTTPException, Depends, Header
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import StreamingResponse
+    from fastapi.responses import StreamingResponse, JSONResponse
     from fastapi.security import APIKeyHeader
 
 print("  → Loading core dependencies...")
 with _console.status("[dim]Loading core dependencies...", spinner="dots"):
     from dotenv import load_dotenv
     import colorlog
-    import json
-    from typing import AsyncGenerator, Any, List, Optional, Union
     from pydantic import BaseModel, Field
 
     # --- Early Log Level Configuration ---
@@ -577,11 +576,6 @@ async def lifespan(app: FastAPI):
         max_concurrent_requests_per_key=max_concurrent_requests_per_key,
     )
 
-    # Log loaded credentials summary (compact, always visible for deployment verification)
-    # _api_summary = ', '.join([f"{p}:{len(c)}" for p, c in api_keys.items()]) if api_keys else "none"
-    # _oauth_summary = ', '.join([f"{p}:{len(c)}" for p, c in oauth_credentials.items()]) if oauth_credentials else "none"
-    # _total_summary = ', '.join([f"{p}:{len(c)}" for p, c in client.all_credentials.items()])
-    # print(f"🔑 Credentials loaded: {_total_summary} (API: {_api_summary} | OAuth: {_oauth_summary})")
     client.background_refresher.start()  # Start the background task
     app.state.rotating_client = client
 
@@ -655,316 +649,396 @@ def get_embedding_batcher(request: Request) -> EmbeddingBatcher:
     return request.app.state.embedding_batcher
 
 
-async def verify_api_key(auth: str = Depends(api_key_header)):
-    """Dependency to verify the proxy API key."""
+async def verify_api_key(
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Dependency to verify the proxy API key.
+    Checks both 'x-api-key' (Anthropic style) and 'Authorization: Bearer ...' (OpenAI style).
+    """
     # If PROXY_API_KEY is not set or empty, skip verification (open access)
     if not PROXY_API_KEY:
-        return auth
-    if not auth or auth != f"Bearer {PROXY_API_KEY}":
-        raise HTTPException(status_code=401, detail="Invalid or missing API Key")
-    return auth
+        return x_api_key or authorization
+
+    # Check x-api-key (Anthropic default)
+    if x_api_key and x_api_key == PROXY_API_KEY:
+        return x_api_key
+
+    # Check Authorization header (OpenAI default)
+    if authorization and authorization == f"Bearer {PROXY_API_KEY}":
+        return authorization
+
+    # Check if authorization is just the key without Bearer (sometimes happens)
+    if authorization and authorization == PROXY_API_KEY:
+        return authorization
+
+    raise HTTPException(status_code=401, detail="Invalid or missing API Key")
 
 
-async def streaming_response_wrapper(
-    request: Request,
-    request_data: dict,
-    response_stream: AsyncGenerator[str, None],
-    logger: Optional[DetailedLogger] = None,
+# --- ANTHROPIC <-> OPENAI ADAPTER LOGIC ---
+
+
+def convert_anthropic_tools_to_openai(anthropic_tools: List[Dict]) -> List[Dict]:
+    """Converts Anthropic tools schema to OpenAI tools schema."""
+    openai_tools = []
+    for tool in anthropic_tools:
+        openai_tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.get("name"),
+                    "description": tool.get("description"),
+                    "parameters": tool.get("input_schema"),
+                },
+            }
+        )
+    return openai_tools
+
+
+def convert_anthropic_messages_to_openai(anthropic_messages: List[Dict]) -> List[Dict]:
+    """
+    Converts Anthropic messages to OpenAI messages.
+    Handles 'tool_result' content blocks by converting them to separate 'tool' role messages.
+    """
+    openai_messages = []
+
+    for msg in anthropic_messages:
+        role = msg.get("role")
+        content = msg.get("content")
+
+        if role == "user" and isinstance(content, list):
+            # Check for tool_result blocks
+            text_parts = []
+            tool_results = []
+            image_parts = []
+
+            for block in content:
+                if block.get("type") == "tool_result":
+                    tool_results.append(block)
+                elif block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+                elif block.get("type") == "image":
+                    # Convert Anthropic image block to OpenAI image_url (roughly)
+                    source = block.get("source", {})
+                    if source.get("type") == "base64":
+                         image_parts.append({
+                             "type": "image_url",
+                             "image_url": {
+                                 "url": f"data:{source.get('media_type')};base64,{source.get('data')}"
+                             }
+                         })
+
+            # 1. Add User Text/Image Message
+            if text_parts or image_parts:
+                user_content = []
+                if text_parts:
+                    user_content.append({"type": "text", "text": "\n".join(text_parts)})
+                user_content.extend(image_parts)
+
+                # If only text, simplify
+                if len(user_content) == 1 and user_content[0]["type"] == "text":
+                    openai_messages.append({"role": "user", "content": user_content[0]["text"]})
+                else:
+                    openai_messages.append({"role": "user", "content": user_content})
+
+            # 2. Add Tool Messages
+            for res in tool_results:
+                tool_content = res.get("content", "")
+                # Anthropic tool result content can be list or string
+                if isinstance(tool_content, list):
+                     # Flatten for OpenAI (usually simple string expected, but can be complex)
+                     # For now, simplistic join
+                     parts = [c.get("text", "") for c in tool_content if c.get("type")=="text"]
+                     tool_content = "\n".join(parts)
+
+                openai_messages.append({
+                    "role": "tool",
+                    "tool_call_id": res.get("tool_use_id"),
+                    "content": tool_content,
+                    "name": "unknown" # OpenAI asks for name, but ID is critical
+                })
+        else:
+            # Standard message or assistant message
+            if role == "assistant" and isinstance(content, list):
+                 # Convert assistant tool_use blocks to OpenAI tool_calls
+                 text_content = ""
+                 tool_calls = []
+                 for block in content:
+                     if block.get("type") == "text":
+                         text_content += block.get("text", "")
+                     elif block.get("type") == "tool_use":
+                         tool_calls.append({
+                             "id": block.get("id"),
+                             "type": "function",
+                             "function": {
+                                 "name": block.get("name"),
+                                 "arguments": json.dumps(block.get("input"))
+                             }
+                         })
+
+                 msg_obj = {"role": "assistant"}
+                 if text_content:
+                     msg_obj["content"] = text_content
+                 if tool_calls:
+                     msg_obj["tool_calls"] = tool_calls
+                 openai_messages.append(msg_obj)
+            else:
+                # Direct copy for simple user/assistant strings
+                openai_messages.append({"role": role, "content": content})
+
+    return openai_messages
+
+
+async def anthropic_stream_generator(
+    response_generator: AsyncGenerator[str, None],
+    request_id: str,
+    model: str
 ) -> AsyncGenerator[str, None]:
     """
-    Wraps a streaming response to log the full response after completion
-    and ensures any errors during the stream are sent to the client.
+    Converts OpenAI SSE stream to Anthropic SSE stream.
+    Complex state machine to handle content blocks and tool use.
     """
-    response_chunks = []
-    full_response = {}
 
-    try:
-        async for chunk_str in response_stream:
-            if await request.is_disconnected():
-                logging.warning("Client disconnected, stopping stream.")
-                break
-            yield chunk_str
-            if chunk_str.strip() and chunk_str.startswith("data:"):
-                content = chunk_str[len("data:") :].strip()
-                if content != "[DONE]":
-                    try:
-                        chunk_data = json.loads(content)
-                        response_chunks.append(chunk_data)
-                        if logger:
-                            logger.log_stream_chunk(chunk_data)
-                    except json.JSONDecodeError:
-                        pass
-    except Exception as e:
-        logging.error(f"An error occurred during the response stream: {e}")
-        # Yield a final error message to the client to ensure they are not left hanging.
-        error_payload = {
-            "error": {
-                "message": f"An unexpected error occurred during the stream: {str(e)}",
-                "type": "proxy_internal_error",
-                "code": 500,
-            }
-        }
-        yield f"data: {json.dumps(error_payload)}\n\n"
-        yield "data: [DONE]\n\n"
-        # Also log this as a failed request
-        if logger:
-            logger.log_final_response(
-                status_code=500, headers=None, body={"error": str(e)}
-            )
-        return  # Stop further processing
-    finally:
-        if response_chunks:
-            # --- Aggregation Logic ---
-            final_message = {"role": "assistant"}
-            aggregated_tool_calls = {}
-            usage_data = None
-            finish_reason = None
+    # 1. Send message_start
+    msg_id = f"msg_{uuid.uuid4().hex[:12]}"
+    yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model, 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})}\n\n"
 
-            for chunk in response_chunks:
-                if "choices" in chunk and chunk["choices"]:
-                    choice = chunk["choices"][0]
-                    delta = choice.get("delta", {})
+    current_block_index = 0
+    current_block_type = None # 'text' or 'tool_use'
 
-                    # Dynamically aggregate all fields from the delta
-                    for key, value in delta.items():
-                        if value is None:
-                            continue
+    # Track tool calls being built
+    # OpenAI sends tool calls as chunks. We need to detect when a NEW tool call starts to issue a new content block.
+    # Map index in OpenAI tool_calls list to Anthropic content block index
+    openai_tool_index_map = {}
 
-                        if key == "content":
-                            if "content" not in final_message:
-                                final_message["content"] = ""
-                            if value:
-                                final_message["content"] += value
+    async for chunk_str in response_generator:
+        if not chunk_str.strip() or not chunk_str.startswith("data:"):
+            continue
 
-                        elif key == "tool_calls":
-                            for tc_chunk in value:
-                                index = tc_chunk["index"]
-                                if index not in aggregated_tool_calls:
-                                    aggregated_tool_calls[index] = {
-                                        "type": "function",
-                                        "function": {"name": "", "arguments": ""},
-                                    }
-                                # Ensure 'function' key exists for this index before accessing its sub-keys
-                                if "function" not in aggregated_tool_calls[index]:
-                                    aggregated_tool_calls[index]["function"] = {
-                                        "name": "",
-                                        "arguments": "",
-                                    }
-                                if tc_chunk.get("id"):
-                                    aggregated_tool_calls[index]["id"] = tc_chunk["id"]
-                                if "function" in tc_chunk:
-                                    if "name" in tc_chunk["function"]:
-                                        if tc_chunk["function"]["name"] is not None:
-                                            aggregated_tool_calls[index]["function"][
-                                                "name"
-                                            ] += tc_chunk["function"]["name"]
-                                    if "arguments" in tc_chunk["function"]:
-                                        if (
-                                            tc_chunk["function"]["arguments"]
-                                            is not None
-                                        ):
-                                            aggregated_tool_calls[index]["function"][
-                                                "arguments"
-                                            ] += tc_chunk["function"]["arguments"]
+        data_str = chunk_str[len("data:") :].strip()
+        if data_str == "[DONE]":
+            break
 
-                        elif key == "function_call":
-                            if "function_call" not in final_message:
-                                final_message["function_call"] = {
-                                    "name": "",
-                                    "arguments": "",
-                                }
-                            if "name" in value:
-                                if value["name"] is not None:
-                                    final_message["function_call"]["name"] += value[
-                                        "name"
-                                    ]
-                            if "arguments" in value:
-                                if value["arguments"] is not None:
-                                    final_message["function_call"]["arguments"] += (
-                                        value["arguments"]
-                                    )
+        try:
+            chunk = json.loads(data_str)
+            choices = chunk.get("choices", [])
+            if not choices:
+                continue
 
-                        else:  # Generic key handling for other data like 'reasoning'
-                            # FIX: Role should always replace, never concatenate
-                            if key == "role":
-                                final_message[key] = value
-                            elif key not in final_message:
-                                final_message[key] = value
-                            elif isinstance(final_message.get(key), str):
-                                final_message[key] += value
-                            else:
-                                final_message[key] = value
+            delta = choices[0].get("delta", {})
+            finish_reason = choices[0].get("finish_reason")
 
-                    if "finish_reason" in choice and choice["finish_reason"]:
-                        finish_reason = choice["finish_reason"]
+            # Handle Text Content
+            if "content" in delta and delta["content"] is not None:
+                text_delta = delta["content"]
 
-                if "usage" in chunk and chunk["usage"]:
-                    usage_data = chunk["usage"]
+                # If we were doing tools, or this is first block
+                if current_block_type != "text":
+                    # If we were inside a tool block, close it? No, Anthropic structure is linear list of blocks.
+                    # Just start a new block.
+                    # But wait, OpenAI sends text OR tool_calls usually not interleaved randomly for the same block?
+                    # Actually, we just need to ensure we emit a block_start if we aren't in text mode.
 
-            # --- Final Response Construction ---
-            if aggregated_tool_calls:
-                final_message["tool_calls"] = list(aggregated_tool_calls.values())
-                # CRITICAL FIX: Override finish_reason when tool_calls exist
-                # This ensures OpenCode and other agentic systems continue the conversation loop
-                finish_reason = "tool_calls"
+                    # If we were in a block, do we need to stop it?
+                    if current_block_type is not None:
+                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_block_index})}\n\n"
+                        current_block_index += 1
 
-            # Ensure standard fields are present for consistent logging
-            for field in ["content", "tool_calls", "function_call"]:
-                if field not in final_message:
-                    final_message[field] = None
+                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': current_block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                    current_block_type = "text"
 
-            first_chunk = response_chunks[0]
-            final_choice = {
-                "index": 0,
-                "message": final_message,
-                "finish_reason": finish_reason,
-            }
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': current_block_index, 'delta': {'type': 'text_delta', 'text': text_delta}})}\n\n"
 
-            full_response = {
-                "id": first_chunk.get("id"),
-                "object": "chat.completion",
-                "created": first_chunk.get("created"),
-                "model": first_chunk.get("model"),
-                "choices": [final_choice],
-                "usage": usage_data,
-            }
+            # Handle Tool Calls
+            if "tool_calls" in delta and delta["tool_calls"]:
+                for tc in delta["tool_calls"]:
+                    idx = tc.get("index")
 
-        if logger:
-            logger.log_final_response(
-                status_code=200,
-                headers=None,  # Headers are not available at this stage
-                body=full_response,
-            )
+                    # If this is a new tool call we haven't seen
+                    if idx not in openai_tool_index_map:
+                        # Close previous block if open
+                        if current_block_type is not None:
+                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_block_index})}\n\n"
+                            current_block_index += 1
 
+                        # Start new tool_use block
+                        # Note: OpenAI sends ID and Name in the first chunk usually
+                        t_id = tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}")
+                        t_name = tc.get("function", {}).get("name", "unknown")
 
-@app.post("/v1/chat/completions")
-async def chat_completions(
+                        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': current_block_index, 'content_block': {'type': 'tool_use', 'id': t_id, 'name': t_name, 'input': {}}})}\n\n"
+
+                        current_block_type = "tool_use"
+                        openai_tool_index_map[idx] = current_block_index
+
+                    # Emit args delta
+                    args = tc.get("function", {}).get("arguments")
+                    if args:
+                        block_idx = openai_tool_index_map[idx]
+                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_idx, 'delta': {'type': 'input_json_delta', 'partial_json': args}})}\n\n"
+
+            # Handle Finish
+            if finish_reason:
+                stop_reason = "end_turn"
+                if finish_reason == "tool_calls":
+                    stop_reason = "tool_use"
+                elif finish_reason == "stop":
+                    stop_reason = "end_turn"
+
+                # Close last block
+                if current_block_type is not None:
+                     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_block_index})}\n\n"
+
+                yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}})}\n\n"
+                yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+
+        except json.JSONDecodeError:
+            continue
+
+@app.post("/v1/messages")
+async def messages_endpoint(
     request: Request,
     client: RotatingClient = Depends(get_rotating_client),
     _=Depends(verify_api_key),
 ):
     """
-    OpenAI-compatible endpoint powered by the RotatingClient.
-    Handles both streaming and non-streaming responses and logs them.
+    Anthropic-compatible endpoint /v1/messages.
+    Translates request to OpenAI format, calls LiteLLM, and translates response back.
     """
     logger = DetailedLogger() if ENABLE_REQUEST_LOGGING else None
     try:
-        # Read and parse the request body only once at the beginning.
         try:
-            request_data = await request.json()
+            anthropic_req = await request.json()
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
 
-        # Global temperature=0 override (controlled by .env variable, default: OFF)
-        # Low temperature makes models deterministic and prone to following training data
-        # instead of actual schemas, which can cause tool hallucination
-        # Modes: "remove" = delete temperature key, "set" = change to 1.0, "false" = disabled
-        override_temp_zero = os.getenv("OVERRIDE_TEMPERATURE_ZERO", "false").lower()
-
-        if (
-            override_temp_zero in ("remove", "set", "true", "1", "yes")
-            and "temperature" in request_data
-            and request_data["temperature"] == 0
-        ):
-            if override_temp_zero == "remove":
-                # Remove temperature key entirely
-                del request_data["temperature"]
-                logging.debug(
-                    "OVERRIDE_TEMPERATURE_ZERO=remove: Removed temperature=0 from request"
-                )
-            else:
-                # Set to 1.0 (for "set", "true", "1", "yes")
-                request_data["temperature"] = 1.0
-                logging.debug(
-                    "OVERRIDE_TEMPERATURE_ZERO=set: Converting temperature=0 to temperature=1.0"
-                )
-
-        # If logging is enabled, perform all logging operations using the parsed data.
         if logger:
-            logger.log_request(headers=request.headers, body=request_data)
+            logger.log_request(headers=request.headers, body=anthropic_req)
 
-        # Extract and log specific reasoning parameters for monitoring.
-        model = request_data.get("model")
-        generation_cfg = (
-            request_data.get("generationConfig", {})
-            or request_data.get("generation_config", {})
-            or {}
-        )
-        reasoning_effort = request_data.get("reasoning_effort") or generation_cfg.get(
-            "reasoning_effort"
-        )
-        custom_reasoning_budget = request_data.get(
-            "custom_reasoning_budget"
-        ) or generation_cfg.get("custom_reasoning_budget", False)
+        # --- 1. Request Adaptation ---
+        openai_req = {
+            "model": anthropic_req.get("model"),
+            "messages": [],
+            "max_tokens": anthropic_req.get("max_tokens", 4096),
+            "stream": anthropic_req.get("stream", False),
+            "temperature": anthropic_req.get("temperature", 1.0)
+        }
 
-        logging.getLogger("rotator_library").debug(
-            f"Handling reasoning parameters: model={model}, reasoning_effort={reasoning_effort}, custom_reasoning_budget={custom_reasoning_budget}"
-        )
+        # System Prompt
+        system_prompt = anthropic_req.get("system")
+        if system_prompt:
+            openai_req["messages"].append({"role": "system", "content": system_prompt})
 
-        # Log basic request info to console (this is a separate, simpler logger).
+        # Messages
+        openai_req["messages"].extend(convert_anthropic_messages_to_openai(anthropic_req.get("messages", [])))
+
+        # Tools
+        anthropic_tools = anthropic_req.get("tools")
+        if anthropic_tools:
+            openai_req["tools"] = convert_anthropic_tools_to_openai(anthropic_tools)
+            # OpenAI requires tool_choice to be 'auto' or specific if tools are present
+            # Anthropic handles this differently, but 'auto' is a safe default for LiteLLM
+            # unless Anthropic 'tool_choice' is specified
+            if "tool_choice" in anthropic_req:
+                tc = anthropic_req["tool_choice"]
+                if tc["type"] == "auto":
+                    openai_req["tool_choice"] = "auto"
+                elif tc["type"] == "any":
+                    openai_req["tool_choice"] = "required"
+                elif tc["type"] == "tool":
+                    openai_req["tool_choice"] = {"type": "function", "function": {"name": tc["name"]}}
+            else:
+                 openai_req["tool_choice"] = "auto"
+
+
         log_request_to_console(
             url=str(request.url),
             headers=dict(request.headers),
             client_info=(request.client.host, request.client.port),
-            request_data=request_data,
+            request_data=openai_req,  # Log the converted request
         )
-        is_streaming = request_data.get("stream", False)
 
-        if is_streaming:
-            response_generator = client.acompletion(request=request, **request_data)
+        # --- 2. Execution ---
+        if openai_req["stream"]:
+            # Streaming Response
+            response_generator = client.acompletion(request=request, **openai_req)
+
             return StreamingResponse(
-                streaming_response_wrapper(
-                    request, request_data, response_generator, logger
-                ),
-                media_type="text/event-stream",
+                anthropic_stream_generator(response_generator, str(uuid.uuid4()), openai_req["model"]),
+                media_type="text/event-stream"
             )
-        else:
-            response = await client.acompletion(request=request, **request_data)
-            if logger:
-                # Assuming response has status_code and headers attributes
-                # This might need adjustment based on the actual response object
-                response_headers = (
-                    response.headers if hasattr(response, "headers") else None
-                )
-                status_code = (
-                    response.status_code if hasattr(response, "status_code") else 200
-                )
-                logger.log_final_response(
-                    status_code=status_code,
-                    headers=response_headers,
-                    body=response.model_dump(),
-                )
-            return response
 
-    except (
-        litellm.InvalidRequestError,
-        ValueError,
-        litellm.ContextWindowExceededError,
-    ) as e:
-        raise HTTPException(status_code=400, detail=f"Invalid Request: {str(e)}")
-    except litellm.AuthenticationError as e:
-        raise HTTPException(status_code=401, detail=f"Authentication Error: {str(e)}")
-    except litellm.RateLimitError as e:
-        raise HTTPException(status_code=429, detail=f"Rate Limit Exceeded: {str(e)}")
-    except (litellm.ServiceUnavailableError, litellm.APIConnectionError) as e:
-        raise HTTPException(status_code=503, detail=f"Service Unavailable: {str(e)}")
-    except litellm.Timeout as e:
-        raise HTTPException(status_code=504, detail=f"Gateway Timeout: {str(e)}")
-    except (litellm.InternalServerError, litellm.OpenAIError) as e:
-        raise HTTPException(status_code=502, detail=f"Bad Gateway: {str(e)}")
-    except Exception as e:
-        logging.error(f"Request failed after all retries: {e}")
-        # Optionally log the failed request
-        if ENABLE_REQUEST_LOGGING:
-            try:
-                request_data = await request.json()
-            except json.JSONDecodeError:
-                request_data = {"error": "Could not parse request body"}
+        else:
+            # Non-Streaming Response
+            response = await client.acompletion(request=request, **openai_req)
+
+            # --- 3. Response Adaptation ---
+            choice = response.choices[0]
+            message = choice.message
+
+            content_blocks = []
+
+            # Text Content
+            if message.content:
+                content_blocks.append({
+                    "type": "text",
+                    "text": message.content
+                })
+
+            # Tool Calls
+            if message.tool_calls:
+                for tc in message.tool_calls:
+                    content_blocks.append({
+                        "type": "tool_use",
+                        "id": tc.id,
+                        "name": tc.function.name,
+                        "input": json.loads(tc.function.arguments)
+                    })
+
+            stop_reason = "end_turn"
+            if choice.finish_reason == "tool_calls":
+                stop_reason = "tool_use"
+            elif choice.finish_reason == "length":
+                stop_reason = "max_tokens"
+
+            anthropic_resp = {
+                "id": response.id,
+                "type": "message",
+                "role": "assistant",
+                "content": content_blocks,
+                "model": response.model,
+                "stop_reason": stop_reason,
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": response.usage.prompt_tokens,
+                    "output_tokens": response.usage.completion_tokens
+                }
+            }
+
             if logger:
                 logger.log_final_response(
-                    status_code=500, headers=None, body={"error": str(e)}
+                    status_code=200,
+                    headers=None,
+                    body=anthropic_resp,
                 )
-        raise HTTPException(status_code=500, detail=str(e))
+
+            return anthropic_resp
+
+    except Exception as e:
+        logging.error(f"Request failed: {e}")
+        error_resp = {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": str(e)
+            }
+        }
+        if logger:
+            logger.log_final_response(
+                status_code=500, headers=None, body=error_resp
+            )
+        return JSONResponse(status_code=500, content=error_resp)
 
 
 @app.post("/v1/embeddings")
@@ -1060,7 +1134,7 @@ async def embeddings(
 
 @app.get("/")
 def read_root():
-    return {"Status": "API Key Proxy is running"}
+    return {"Status": "API Key Proxy is running (Anthropic Compatible)"}
 
 
 @app.get("/v1/models")
@@ -1071,11 +1145,7 @@ async def list_models(
     enriched: bool = True,
 ):
     """
-    Returns a list of available models in the OpenAI-compatible format.
-
-    Query Parameters:
-        enriched: If True (default), returns detailed model info with pricing and capabilities.
-                  If False, returns minimal OpenAI-compatible response.
+    Returns a list of available models.
     """
     model_ids = await client.get_all_available_models(grouped=False)
 
@@ -1107,9 +1177,6 @@ async def get_model(
 ):
     """
     Returns detailed information about a specific model.
-
-    Path Parameters:
-        model_id: The model ID (e.g., "anthropic/claude-3-opus", "openrouter/openai/gpt-4")
     """
     if hasattr(request.app.state, "model_info_service"):
         model_info_service = request.app.state.model_info_service
@@ -1133,7 +1200,7 @@ async def model_info_stats(
     _=Depends(verify_api_key),
 ):
     """
-    Returns statistics about the model info service (for monitoring/debugging).
+    Returns statistics about the model info service.
     """
     if hasattr(request.app.state, "model_info_service"):
         return request.app.state.model_info_service.get_stats()
@@ -1155,7 +1222,7 @@ async def token_count(
     _=Depends(verify_api_key),
 ):
     """
-    Calculates the token count for a given list of messages and a model.
+    Calculates the token count.
     """
     try:
         data = await request.json()
@@ -1178,28 +1245,7 @@ async def token_count(
 @app.post("/v1/cost-estimate")
 async def cost_estimate(request: Request, _=Depends(verify_api_key)):
     """
-    Estimates the cost for a request based on token counts and model pricing.
-
-    Request body:
-        {
-            "model": "anthropic/claude-3-opus",
-            "prompt_tokens": 1000,
-            "completion_tokens": 500,
-            "cache_read_tokens": 0,       # optional
-            "cache_creation_tokens": 0    # optional
-        }
-
-    Returns:
-        {
-            "model": "anthropic/claude-3-opus",
-            "cost": 0.0375,
-            "currency": "USD",
-            "pricing": {
-                "input_cost_per_token": 0.000015,
-                "output_cost_per_token": 0.000075
-            },
-            "source": "model_info_service"  # or "litellm_fallback"
-        }
+    Estimates the cost for a request.
     """
     try:
         data = await request.json()
