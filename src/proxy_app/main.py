@@ -107,7 +107,6 @@ with _console.status("[dim]Loading core dependencies...", spinner="dots"):
     from dotenv import load_dotenv
     import colorlog
     import json
-    import inspect
     from typing import AsyncGenerator, Any, List, Optional, Union
     from pydantic import BaseModel, Field
 
@@ -791,11 +790,19 @@ async def anthropic_messages(
             )
         except (ValueError, TypeError, litellm.OpenAIError) as e:
             logging.debug(f"Token counting failed for streaming preflight: {e}")
+            try:
+                serialized_messages = json.dumps(
+                    openai_request.get("messages", []), ensure_ascii=False
+                )
+                input_tokens = max(1, len(serialized_messages) // 4)
+            except Exception as fallback_error:
+                logging.debug(
+                    f"Token counting fallback estimation failed: {fallback_error}"
+                )
+                input_tokens = 0
 
         if is_streaming:
             openai_stream = client.acompletion(request=request, **openai_request)
-            if inspect.isawaitable(openai_stream):
-                openai_stream = await openai_stream
             anthropic_stream = convert_openai_stream_to_anthropic(
                 openai_stream,
                 request_data.get("model", openai_request.get("model", "")),
@@ -813,21 +820,30 @@ async def anthropic_messages(
                 request=request, **openai_request
             )
 
-            if openai_response is None:
+            def _normalize_openai_response(response_obj: Any) -> dict:
+                if response_obj is None:
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "type": "api_error",
+                            "message": "Upstream returned an empty response.",
+                        },
+                    )
+                if isinstance(response_obj, BaseModel):
+                    return response_obj.model_dump()
+                if isinstance(response_obj, dict):
+                    return response_obj
+                if hasattr(response_obj, "dict"):
+                    return response_obj.dict()
                 raise HTTPException(
                     status_code=502,
                     detail={
                         "type": "api_error",
-                        "message": "Upstream returned an empty response.",
+                        "message": "Unexpected response format from upstream.",
                     },
                 )
 
-            if isinstance(openai_response, BaseModel):
-                openai_payload = openai_response.model_dump()
-            elif hasattr(openai_response, "dict"):
-                openai_payload = openai_response.dict()
-            else:
-                openai_payload = openai_response
+            openai_payload = _normalize_openai_response(openai_response)
 
             anthropic_response = response_from_openai(
                 openai_payload,
