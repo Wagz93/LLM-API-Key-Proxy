@@ -768,7 +768,7 @@ async def anthropic_messages(
                 detail={"type": "invalid_request_error", "message": str(e)},
             )
 
-        is_streaming = bool(request_data.get("stream", False))
+        is_streaming = request_data.get("stream", False)
         openai_request["stream"] = is_streaming
 
         # Log the request
