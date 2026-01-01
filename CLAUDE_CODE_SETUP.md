@@ -25,6 +25,7 @@ This proxy transforms API requests to make any LLM provider (OpenAI, Google Gemi
 - Supports streaming with proper Anthropic SSE events
 - Handles tool calling (function calls) in Anthropic format
 - Manages multiple provider credentials with rotation
+- Accepts Claude Code telemetry at `/api/event_logging/batch` (silently logged, prevents 404 errors)
 
 ---
 
@@ -576,6 +577,17 @@ Restart the proxy.
    ```bash
    ssh -L 8085:localhost:8085 user@your-server
    ```
+
+#### Issue: "404 Not Found" for `/api/event_logging/batch`
+
+**Note:** This issue has been resolved in the latest version.
+
+**Background:** Claude Code sends telemetry/analytics events to `/api/event_logging/batch`. Earlier versions of the proxy didn't have this endpoint, resulting in 404 errors in the logs.
+
+**Solution:** 
+- Update to the latest version of the proxy, which includes this endpoint
+- The endpoint silently accepts and logs telemetry events at debug level
+- No action required from users - the endpoint requires no authentication and doesn't affect functionality
 
 ### Debugging Tips
 
