@@ -643,6 +643,8 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
+# Anthropic uses x-api-key header for authentication
+anthropic_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 
 
 def get_rotating_client(request: Request) -> RotatingClient:
@@ -663,6 +665,35 @@ async def verify_api_key(auth: str = Depends(api_key_header)):
     if not auth or auth != f"Bearer {PROXY_API_KEY}":
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
     return auth
+
+
+async def verify_anthropic_api_key(
+    x_api_key: str = Depends(anthropic_api_key_header),
+    auth: str = Depends(api_key_header),
+):
+    """
+    Dependency to verify the proxy API key for Anthropic-style requests.
+    Anthropic uses x-api-key header, but we also accept Authorization: Bearer for compatibility.
+    """
+    # If PROXY_API_KEY is not set or empty, skip verification (open access)
+    if not PROXY_API_KEY:
+        return x_api_key or auth
+
+    # Check x-api-key header first (Anthropic style)
+    if x_api_key and x_api_key == PROXY_API_KEY:
+        return x_api_key
+
+    # Fall back to Authorization header (OpenAI style)
+    if auth and auth == f"Bearer {PROXY_API_KEY}":
+        return auth
+
+    raise HTTPException(
+        status_code=401,
+        detail={
+            "type": "authentication_error",
+            "message": "Invalid or missing API Key. Use x-api-key header or Authorization: Bearer.",
+        },
+    )
 
 
 async def streaming_response_wrapper(
@@ -965,6 +996,168 @@ async def chat_completions(
                     status_code=500, headers=None, body={"error": str(e)}
                 )
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/messages")
+async def anthropic_messages(
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_anthropic_api_key),
+):
+    """
+    Anthropic-compatible endpoint for the Messages API.
+    This endpoint allows Anthropic clients (like Claude Code) to use the proxy.
+
+    Headers:
+        x-api-key: Your PROXY_API_KEY (Anthropic style)
+        Authorization: Bearer {PROXY_API_KEY} (OpenAI style, also accepted)
+        anthropic-version: API version (optional, for compatibility)
+
+    Request Body:
+        Standard Anthropic Messages API format with model, messages, max_tokens, etc.
+        The model should be in provider/model format (e.g., "anthropic/claude-3-5-sonnet")
+    """
+    logger = DetailedLogger() if ENABLE_REQUEST_LOGGING else None
+    try:
+        # Read and parse the request body
+        try:
+            request_data = await request.json()
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "type": "invalid_request_error",
+                    "message": "Invalid JSON in request body.",
+                },
+            )
+
+        # Log the request
+        if logger:
+            logger.log_request(headers=request.headers, body=request_data)
+
+        log_request_to_console(
+            url=str(request.url),
+            headers=dict(request.headers),
+            client_info=(request.client.host, request.client.port),
+            request_data=request_data,
+        )
+
+        is_streaming = request_data.get("stream", False)
+
+        if is_streaming:
+            # For streaming, anthropic_messages is async and returns an async generator
+            # We need to await it to get the generator
+            response_generator = await client.anthropic_messages(
+                request=request, **request_data
+            )
+            return StreamingResponse(
+                anthropic_streaming_response_wrapper(
+                    request, request_data, response_generator, logger
+                ),
+                media_type="text/event-stream",
+            )
+        else:
+            # For non-streaming, call the method and return the response
+            response = await client.anthropic_messages(request=request, **request_data)
+
+            if logger:
+                logger.log_final_response(status_code=200, headers=None, body=response)
+
+            return response
+
+    except HTTPException:
+        raise
+    except (
+        litellm.InvalidRequestError,
+        ValueError,
+        litellm.ContextWindowExceededError,
+    ) as e:
+        raise HTTPException(
+            status_code=400,
+            detail={"type": "invalid_request_error", "message": str(e)},
+        )
+    except litellm.AuthenticationError as e:
+        raise HTTPException(
+            status_code=401,
+            detail={"type": "authentication_error", "message": str(e)},
+        )
+    except litellm.RateLimitError as e:
+        raise HTTPException(
+            status_code=429,
+            detail={"type": "rate_limit_error", "message": str(e)},
+        )
+    except (litellm.ServiceUnavailableError, litellm.APIConnectionError) as e:
+        raise HTTPException(
+            status_code=503,
+            detail={"type": "api_error", "message": f"Service Unavailable: {str(e)}"},
+        )
+    except litellm.Timeout as e:
+        raise HTTPException(
+            status_code=504,
+            detail={"type": "api_error", "message": f"Gateway Timeout: {str(e)}"},
+        )
+    except (litellm.InternalServerError, litellm.OpenAIError) as e:
+        raise HTTPException(
+            status_code=502,
+            detail={"type": "api_error", "message": f"Bad Gateway: {str(e)}"},
+        )
+    except Exception as e:
+        logging.error(f"Anthropic Messages request failed: {e}")
+        if logger:
+            logger.log_final_response(
+                status_code=500, headers=None, body={"error": str(e)}
+            )
+        raise HTTPException(
+            status_code=500,
+            detail={"type": "api_error", "message": str(e)},
+        )
+
+
+async def anthropic_streaming_response_wrapper(
+    request: Request,
+    request_data: dict,
+    response_stream: AsyncGenerator[str, None],
+    logger: Optional[DetailedLogger] = None,
+) -> AsyncGenerator[str, None]:
+    """
+    Wraps an Anthropic streaming response to handle logging and errors.
+    The stream is already in Anthropic SSE format from convert_openai_stream_to_anthropic.
+    """
+    try:
+        async for event in response_stream:
+            if await request.is_disconnected():
+                logging.warning("Client disconnected, stopping Anthropic stream.")
+                break
+            yield event
+
+            # Log streaming events if detailed logging is enabled
+            if logger and event.startswith("event:"):
+                try:
+                    # Parse the SSE event
+                    lines = event.strip().split("\n")
+                    if len(lines) >= 2 and lines[1].startswith("data:"):
+                        data_str = lines[1][5:].strip()
+                        chunk_data = json.loads(data_str)
+                        logger.log_stream_chunk(chunk_data)
+                except (json.JSONDecodeError, IndexError):
+                    pass
+
+    except Exception as e:
+        logging.error(f"An error occurred during the Anthropic response stream: {e}")
+        # Yield an error event in Anthropic format
+        error_event = {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": f"An unexpected error occurred during the stream: {str(e)}",
+            },
+        }
+        yield f"event: error\ndata: {json.dumps(error_event)}\n\n"
+
+        if logger:
+            logger.log_final_response(
+                status_code=500, headers=None, body={"error": str(e)}
+            )
 
 
 @app.post("/v1/embeddings")
