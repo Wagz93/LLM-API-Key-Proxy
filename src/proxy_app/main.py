@@ -107,6 +107,7 @@ with _console.status("[dim]Loading core dependencies...", spinner="dots"):
     from dotenv import load_dotenv
     import colorlog
     import json
+    import inspect
     from typing import AsyncGenerator, Any, List, Optional, Union
     from pydantic import BaseModel, Field
 
@@ -790,10 +791,11 @@ async def anthropic_messages(
             )
         except (ValueError, TypeError, litellm.OpenAIError) as e:
             logging.debug(f"Token counting failed for streaming preflight: {e}")
-            input_tokens = 0
 
         if is_streaming:
             openai_stream = client.acompletion(request=request, **openai_request)
+            if inspect.isawaitable(openai_stream):
+                openai_stream = await openai_stream
             anthropic_stream = convert_openai_stream_to_anthropic(
                 openai_stream,
                 request_data.get("model", openai_request.get("model", "")),
@@ -810,6 +812,15 @@ async def anthropic_messages(
             openai_response = await client.acompletion(
                 request=request, **openai_request
             )
+
+            if openai_response is None:
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "type": "api_error",
+                        "message": "Upstream returned an empty response.",
+                    },
+                )
 
             if isinstance(openai_response, BaseModel):
                 openai_payload = openai_response.model_dump()
