@@ -1463,6 +1463,31 @@ async def cost_estimate(request: Request, _=Depends(verify_api_key)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/event_logging/batch")
+async def event_logging_batch(request: Request):
+    """
+    Claude Code telemetry endpoint.
+    This endpoint accepts telemetry/analytics events from Claude Code clients.
+    The proxy silently accepts these requests to prevent 404 errors in the client logs.
+    
+    No authentication is required for telemetry endpoints.
+    Events are logged at debug level but not processed.
+    """
+    try:
+        # Read the telemetry data
+        data = await request.json()
+        
+        # Log the event at debug level for troubleshooting
+        logging.debug(f"Received telemetry event: {len(data.get('events', []))} events")
+        
+        # Return success response (Claude Code expects a 200 OK)
+        return {"status": "ok"}
+    except Exception as e:
+        # Even if parsing fails, return success to prevent client-side errors
+        logging.debug(f"Telemetry endpoint error (ignoring): {e}")
+        return {"status": "ok"}
+
+
 if __name__ == "__main__":
     # Define ENV_FILE for onboarding checks using centralized path
     ENV_FILE = get_data_file(".env")
