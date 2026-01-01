@@ -99,7 +99,7 @@ with _console.status("[dim]Loading FastAPI framework...", spinner="dots"):
     from contextlib import asynccontextmanager
     from fastapi import FastAPI, Request, HTTPException, Depends
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import StreamingResponse
+    from fastapi.responses import StreamingResponse, JSONResponse
     from fastapi.security import APIKeyHeader
 
 print("  → Loading core dependencies...")
@@ -127,6 +127,11 @@ with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from proxy_app.request_logger import log_request_to_console
     from proxy_app.batch_manager import EmbeddingBatcher
     from proxy_app.detailed_logger import DetailedLogger
+    from rotator_library.anthropic_compat import (
+        request_to_openai,
+        response_from_openai,
+        convert_openai_stream_to_anthropic,
+    )
 
 print("  → Discovering provider plugins...")
 # Provider lazy loading happens during import, so time it here
@@ -340,6 +345,8 @@ ENABLE_REQUEST_LOGGING = args.enable_request_logging
 if ENABLE_REQUEST_LOGGING:
     logging.info("Request logging is enabled.")
 PROXY_API_KEY = os.getenv("PROXY_API_KEY")
+# Default Anthropic version header value (can be overridden via env)
+ANTHROPIC_VERSION = os.getenv("ANTHROPIC_VERSION", "2023-06-01")
 # Note: PROXY_API_KEY validation moved to server startup to allow credential tool to run first
 
 # Discover API keys from environment variables
@@ -696,308 +703,6 @@ async def verify_anthropic_api_key(
     )
 
 
-async def streaming_response_wrapper(
-    request: Request,
-    request_data: dict,
-    response_stream: AsyncGenerator[str, None],
-    logger: Optional[DetailedLogger] = None,
-) -> AsyncGenerator[str, None]:
-    """
-    Wraps a streaming response to log the full response after completion
-    and ensures any errors during the stream are sent to the client.
-    """
-    response_chunks = []
-    full_response = {}
-
-    try:
-        async for chunk_str in response_stream:
-            if await request.is_disconnected():
-                logging.warning("Client disconnected, stopping stream.")
-                break
-            yield chunk_str
-            if chunk_str.strip() and chunk_str.startswith("data:"):
-                content = chunk_str[len("data:") :].strip()
-                if content != "[DONE]":
-                    try:
-                        chunk_data = json.loads(content)
-                        response_chunks.append(chunk_data)
-                        if logger:
-                            logger.log_stream_chunk(chunk_data)
-                    except json.JSONDecodeError:
-                        pass
-    except Exception as e:
-        logging.error(f"An error occurred during the response stream: {e}")
-        # Yield a final error message to the client to ensure they are not left hanging.
-        error_payload = {
-            "error": {
-                "message": f"An unexpected error occurred during the stream: {str(e)}",
-                "type": "proxy_internal_error",
-                "code": 500,
-            }
-        }
-        yield f"data: {json.dumps(error_payload)}\n\n"
-        yield "data: [DONE]\n\n"
-        # Also log this as a failed request
-        if logger:
-            logger.log_final_response(
-                status_code=500, headers=None, body={"error": str(e)}
-            )
-        return  # Stop further processing
-    finally:
-        if response_chunks:
-            # --- Aggregation Logic ---
-            final_message = {"role": "assistant"}
-            aggregated_tool_calls = {}
-            usage_data = None
-            finish_reason = None
-
-            for chunk in response_chunks:
-                if "choices" in chunk and chunk["choices"]:
-                    choice = chunk["choices"][0]
-                    delta = choice.get("delta", {})
-
-                    # Dynamically aggregate all fields from the delta
-                    for key, value in delta.items():
-                        if value is None:
-                            continue
-
-                        if key == "content":
-                            if "content" not in final_message:
-                                final_message["content"] = ""
-                            if value:
-                                final_message["content"] += value
-
-                        elif key == "tool_calls":
-                            for tc_chunk in value:
-                                index = tc_chunk["index"]
-                                if index not in aggregated_tool_calls:
-                                    aggregated_tool_calls[index] = {
-                                        "type": "function",
-                                        "function": {"name": "", "arguments": ""},
-                                    }
-                                # Ensure 'function' key exists for this index before accessing its sub-keys
-                                if "function" not in aggregated_tool_calls[index]:
-                                    aggregated_tool_calls[index]["function"] = {
-                                        "name": "",
-                                        "arguments": "",
-                                    }
-                                if tc_chunk.get("id"):
-                                    aggregated_tool_calls[index]["id"] = tc_chunk["id"]
-                                if "function" in tc_chunk:
-                                    if "name" in tc_chunk["function"]:
-                                        if tc_chunk["function"]["name"] is not None:
-                                            aggregated_tool_calls[index]["function"][
-                                                "name"
-                                            ] += tc_chunk["function"]["name"]
-                                    if "arguments" in tc_chunk["function"]:
-                                        if (
-                                            tc_chunk["function"]["arguments"]
-                                            is not None
-                                        ):
-                                            aggregated_tool_calls[index]["function"][
-                                                "arguments"
-                                            ] += tc_chunk["function"]["arguments"]
-
-                        elif key == "function_call":
-                            if "function_call" not in final_message:
-                                final_message["function_call"] = {
-                                    "name": "",
-                                    "arguments": "",
-                                }
-                            if "name" in value:
-                                if value["name"] is not None:
-                                    final_message["function_call"]["name"] += value[
-                                        "name"
-                                    ]
-                            if "arguments" in value:
-                                if value["arguments"] is not None:
-                                    final_message["function_call"]["arguments"] += (
-                                        value["arguments"]
-                                    )
-
-                        else:  # Generic key handling for other data like 'reasoning'
-                            # FIX: Role should always replace, never concatenate
-                            if key == "role":
-                                final_message[key] = value
-                            elif key not in final_message:
-                                final_message[key] = value
-                            elif isinstance(final_message.get(key), str):
-                                final_message[key] += value
-                            else:
-                                final_message[key] = value
-
-                    if "finish_reason" in choice and choice["finish_reason"]:
-                        finish_reason = choice["finish_reason"]
-
-                if "usage" in chunk and chunk["usage"]:
-                    usage_data = chunk["usage"]
-
-            # --- Final Response Construction ---
-            if aggregated_tool_calls:
-                final_message["tool_calls"] = list(aggregated_tool_calls.values())
-                # CRITICAL FIX: Override finish_reason when tool_calls exist
-                # This ensures OpenCode and other agentic systems continue the conversation loop
-                finish_reason = "tool_calls"
-
-            # Ensure standard fields are present for consistent logging
-            for field in ["content", "tool_calls", "function_call"]:
-                if field not in final_message:
-                    final_message[field] = None
-
-            first_chunk = response_chunks[0]
-            final_choice = {
-                "index": 0,
-                "message": final_message,
-                "finish_reason": finish_reason,
-            }
-
-            full_response = {
-                "id": first_chunk.get("id"),
-                "object": "chat.completion",
-                "created": first_chunk.get("created"),
-                "model": first_chunk.get("model"),
-                "choices": [final_choice],
-                "usage": usage_data,
-            }
-
-        if logger:
-            logger.log_final_response(
-                status_code=200,
-                headers=None,  # Headers are not available at this stage
-                body=full_response,
-            )
-
-
-@app.post("/v1/chat/completions")
-async def chat_completions(
-    request: Request,
-    client: RotatingClient = Depends(get_rotating_client),
-    _=Depends(verify_api_key),
-):
-    """
-    OpenAI-compatible endpoint powered by the RotatingClient.
-    Handles both streaming and non-streaming responses and logs them.
-    """
-    logger = DetailedLogger() if ENABLE_REQUEST_LOGGING else None
-    try:
-        # Read and parse the request body only once at the beginning.
-        try:
-            request_data = await request.json()
-        except json.JSONDecodeError:
-            raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
-
-        # Global temperature=0 override (controlled by .env variable, default: OFF)
-        # Low temperature makes models deterministic and prone to following training data
-        # instead of actual schemas, which can cause tool hallucination
-        # Modes: "remove" = delete temperature key, "set" = change to 1.0, "false" = disabled
-        override_temp_zero = os.getenv("OVERRIDE_TEMPERATURE_ZERO", "false").lower()
-
-        if (
-            override_temp_zero in ("remove", "set", "true", "1", "yes")
-            and "temperature" in request_data
-            and request_data["temperature"] == 0
-        ):
-            if override_temp_zero == "remove":
-                # Remove temperature key entirely
-                del request_data["temperature"]
-                logging.debug(
-                    "OVERRIDE_TEMPERATURE_ZERO=remove: Removed temperature=0 from request"
-                )
-            else:
-                # Set to 1.0 (for "set", "true", "1", "yes")
-                request_data["temperature"] = 1.0
-                logging.debug(
-                    "OVERRIDE_TEMPERATURE_ZERO=set: Converting temperature=0 to temperature=1.0"
-                )
-
-        # If logging is enabled, perform all logging operations using the parsed data.
-        if logger:
-            logger.log_request(headers=request.headers, body=request_data)
-
-        # Extract and log specific reasoning parameters for monitoring.
-        model = request_data.get("model")
-        generation_cfg = (
-            request_data.get("generationConfig", {})
-            or request_data.get("generation_config", {})
-            or {}
-        )
-        reasoning_effort = request_data.get("reasoning_effort") or generation_cfg.get(
-            "reasoning_effort"
-        )
-        custom_reasoning_budget = request_data.get(
-            "custom_reasoning_budget"
-        ) or generation_cfg.get("custom_reasoning_budget", False)
-
-        logging.getLogger("rotator_library").debug(
-            f"Handling reasoning parameters: model={model}, reasoning_effort={reasoning_effort}, custom_reasoning_budget={custom_reasoning_budget}"
-        )
-
-        # Log basic request info to console (this is a separate, simpler logger).
-        log_request_to_console(
-            url=str(request.url),
-            headers=dict(request.headers),
-            client_info=(request.client.host, request.client.port),
-            request_data=request_data,
-        )
-        is_streaming = request_data.get("stream", False)
-
-        if is_streaming:
-            response_generator = client.acompletion(request=request, **request_data)
-            return StreamingResponse(
-                streaming_response_wrapper(
-                    request, request_data, response_generator, logger
-                ),
-                media_type="text/event-stream",
-            )
-        else:
-            response = await client.acompletion(request=request, **request_data)
-            if logger:
-                # Assuming response has status_code and headers attributes
-                # This might need adjustment based on the actual response object
-                response_headers = (
-                    response.headers if hasattr(response, "headers") else None
-                )
-                status_code = (
-                    response.status_code if hasattr(response, "status_code") else 200
-                )
-                logger.log_final_response(
-                    status_code=status_code,
-                    headers=response_headers,
-                    body=response.model_dump(),
-                )
-            return response
-
-    except (
-        litellm.InvalidRequestError,
-        ValueError,
-        litellm.ContextWindowExceededError,
-    ) as e:
-        raise HTTPException(status_code=400, detail=f"Invalid Request: {str(e)}")
-    except litellm.AuthenticationError as e:
-        raise HTTPException(status_code=401, detail=f"Authentication Error: {str(e)}")
-    except litellm.RateLimitError as e:
-        raise HTTPException(status_code=429, detail=f"Rate Limit Exceeded: {str(e)}")
-    except (litellm.ServiceUnavailableError, litellm.APIConnectionError) as e:
-        raise HTTPException(status_code=503, detail=f"Service Unavailable: {str(e)}")
-    except litellm.Timeout as e:
-        raise HTTPException(status_code=504, detail=f"Gateway Timeout: {str(e)}")
-    except (litellm.InternalServerError, litellm.OpenAIError) as e:
-        raise HTTPException(status_code=502, detail=f"Bad Gateway: {str(e)}")
-    except Exception as e:
-        logging.error(f"Request failed after all retries: {e}")
-        # Optionally log the failed request
-        if ENABLE_REQUEST_LOGGING:
-            try:
-                request_data = await request.json()
-            except json.JSONDecodeError:
-                request_data = {"error": "Could not parse request body"}
-            if logger:
-                logger.log_final_response(
-                    status_code=500, headers=None, body={"error": str(e)}
-                )
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.post("/v1/messages")
 async def anthropic_messages(
     request: Request,
@@ -1031,6 +736,41 @@ async def anthropic_messages(
                 },
             )
 
+        # Respect Anthropic version header (defaulted via env if missing)
+        request_anthropic_version = (
+            request.headers.get("anthropic-version") or ANTHROPIC_VERSION
+        )
+
+        # Global temperature=0 override (mirrors OpenAI path)
+        override_temp_zero = os.getenv("OVERRIDE_TEMPERATURE_ZERO", "false").lower()
+        if (
+            override_temp_zero in ("remove", "set", "true", "1", "yes")
+            and "temperature" in request_data
+            and request_data["temperature"] == 0
+        ):
+            if override_temp_zero == "remove":
+                del request_data["temperature"]
+                logging.debug(
+                    "OVERRIDE_TEMPERATURE_ZERO=remove: Removed temperature=0 from request"
+                )
+            else:
+                request_data["temperature"] = 1.0
+                logging.debug(
+                    "OVERRIDE_TEMPERATURE_ZERO=set: Converting temperature=0 to temperature=1.0"
+                )
+
+        # Translate Anthropic request to OpenAI-compatible payload
+        try:
+            openai_request = request_to_openai(request_data)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400,
+                detail={"type": "invalid_request_error", "message": str(e)},
+            )
+
+        is_streaming = request_data.get("stream", False)
+        openai_request["stream"] = is_streaming
+
         # Log the request
         if logger:
             logger.log_request(headers=request.headers, body=request_data)
@@ -1041,29 +781,84 @@ async def anthropic_messages(
             client_info=(request.client.host, request.client.port),
             request_data=request_data,
         )
-
-        is_streaming = request_data.get("stream", False)
+        # Try to pre-compute input tokens for streaming usage accounting
+        input_tokens = 0
+        try:
+            input_tokens = client.token_count(
+                model=openai_request.get("model", ""),
+                messages=openai_request.get("messages", []),
+            )
+        except (ValueError, TypeError, litellm.OpenAIError) as e:
+            logging.debug(f"Token counting failed for streaming preflight: {e}")
+            try:
+                serialized_messages = json.dumps(
+                    openai_request.get("messages", []), ensure_ascii=False
+                )
+                input_tokens = max(1, len(serialized_messages) // 4)
+            except Exception as fallback_error:
+                logging.debug(
+                    f"Token counting fallback estimation failed: {fallback_error}"
+                )
+                input_tokens = 0
 
         if is_streaming:
-            # For streaming, anthropic_messages is async and returns an async generator
-            # We need to await it to get the generator
-            response_generator = await client.anthropic_messages(
-                request=request, **request_data
+            openai_stream = client.acompletion(request=request, **openai_request)
+            anthropic_stream = convert_openai_stream_to_anthropic(
+                openai_stream,
+                request_data.get("model", openai_request.get("model", "")),
+                input_tokens,
             )
             return StreamingResponse(
                 anthropic_streaming_response_wrapper(
-                    request, request_data, response_generator, logger
+                    request, request_data, anthropic_stream, logger
                 ),
                 media_type="text/event-stream",
+                headers={"anthropic-version": request_anthropic_version},
             )
         else:
-            # For non-streaming, call the method and return the response
-            response = await client.anthropic_messages(request=request, **request_data)
+            openai_response = await client.acompletion(
+                request=request, **openai_request
+            )
+
+            def _normalize_openai_response(response_obj: Any) -> dict:
+                if response_obj is None:
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "type": "api_error",
+                            "message": "Upstream returned an empty response.",
+                        },
+                    )
+                if isinstance(response_obj, BaseModel):
+                    return response_obj.model_dump()
+                if isinstance(response_obj, dict):
+                    return response_obj
+                if hasattr(response_obj, "dict"):
+                    return response_obj.dict()
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "type": "api_error",
+                        "message": "Unexpected response format from upstream.",
+                    },
+                )
+
+            openai_payload = _normalize_openai_response(openai_response)
+
+            anthropic_response = response_from_openai(
+                openai_payload,
+                request_data.get("model", openai_request.get("model", "")),
+            )
 
             if logger:
-                logger.log_final_response(status_code=200, headers=None, body=response)
+                logger.log_final_response(
+                    status_code=200, headers=None, body=anthropic_response
+                )
 
-            return response
+            return JSONResponse(
+                content=anthropic_response,
+                headers={"anthropic-version": request_anthropic_version},
+            )
 
     except HTTPException:
         raise
