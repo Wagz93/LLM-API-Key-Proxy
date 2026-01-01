@@ -79,6 +79,7 @@ claude "Write a Python function to calculate fibonacci"
 - ✅ System messages and multi-turn conversations
 - ✅ Authentication via `x-api-key` header (Anthropic style)
 - ✅ Full Anthropic API error format compatibility
+- ✅ Telemetry endpoint for Claude Code analytics (no 404 errors)
 
 **Model Format:**
 ```bash
