@@ -54,6 +54,46 @@ python src/proxy_app/main.py
 
 ---
 
+## 🎯 Claude Code Integration
+
+This proxy now includes **full support for Anthropic's Messages API (`/v1/messages`)**, making it compatible with **Claude Code** (Anthropic's AI code assistant)!
+
+Use any LLM provider (OpenAI, Gemini, etc.) with Claude Code through Anthropic's native API format.
+
+**Quick Setup:**
+```bash
+# 1. Configure the proxy (if not already done)
+python src/proxy_app/main.py --add-credential
+
+# 2. Point Claude Code to your proxy
+export ANTHROPIC_API_KEY="your-proxy-api-key"  # Your PROXY_API_KEY from .env
+export ANTHROPIC_BASE_URL="http://localhost:8000"
+
+# 3. Use Claude Code normally!
+claude "Write a Python function to calculate fibonacci"
+```
+
+**What works:**
+- ✅ Non-streaming and streaming responses (SSE)
+- ✅ Tool calling (function calling) - essential for code editing
+- ✅ System messages and multi-turn conversations
+- ✅ Authentication via `x-api-key` header (Anthropic style)
+- ✅ Full Anthropic API error format compatibility
+
+**Model Format:**
+```bash
+# In Claude Code config, specify models in provider/model format:
+openai/gpt-4o                    # Use GPT-4 through the proxy
+gemini/gemini-2.0-flash-exp      # Use Gemini through the proxy
+anthropic/claude-3-5-sonnet      # Use real Anthropic API
+```
+
+📖 **Complete Guide:** [CLAUDE_CODE_SETUP.md](CLAUDE_CODE_SETUP.md) - Detailed setup, configuration, troubleshooting  
+📚 **API Reference:** [ANTHROPIC_API_GUIDE.md](ANTHROPIC_API_GUIDE.md) - Full API compatibility details  
+🧪 **Test Script:** `python examples/anthropic_test.py` - Validate your setup
+
+---
+
 ## Connecting to the Proxy
 
 Once the proxy is running, configure your application with these settings:
